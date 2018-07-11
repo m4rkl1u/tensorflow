@@ -80,8 +80,10 @@ Status FusedIrEmitter::HandleConstant(HloInstruction* constant) {
       *ir_builder_->GetInsertBlock()->getModule(), initializer->getType(),
       /*isConstant=*/true, llvm::GlobalValue::ExternalLinkage, initializer,
       /*Name=*/"");
+  llvm::Constant* shape_constant = llvm::ConstantExpr::getBitCast(
+      global, llvm_ir::ShapeToIrType(literal.shape(), module_)->getPointerTo());
   generators_[constant] = [=](const IrArray::Index& index) {
-    return IrArray(global, constant->shape())
+    return IrArray(shape_constant, constant->shape())
         .EmitReadArrayElement(index, ir_builder_);
   };
 
@@ -117,7 +119,20 @@ Status FusedIrEmitter::HandleGetTupleElement(
 }
 
 Status FusedIrEmitter::HandleParameter(HloInstruction* parameter) {
-  generators_[parameter] = [=](const IrArray::Index& index) {
+  generators_[parameter] = [=](const IrArray::Index& index) -> llvm::Value* {
+    if (tiled_parameter_info_) {
+      llvm::Value* param_buffer = tiled_parameter_info_->GetBufferForParameter(
+          parameter->parameter_number());
+      if (param_buffer) {
+        VLOG(3) << "Use buffer for " << parameter->ToString();
+        return ir_builder_->CreateLoad(
+            ir_builder_->CreateGEP(
+                param_buffer,
+                {index.GetConstantWithIndexType(0), tiled_parameter_info_->x(),
+                 tiled_parameter_info_->y()}),
+            "tiled_buffer");
+      }
+    }
     return parameter_arrays_[parameter->parameter_number()]
         .EmitReadArrayElement(index, ir_builder_);
   };
@@ -151,7 +166,7 @@ Status FusedIrEmitter::HandleTuple(HloInstruction* tuple) {
 
 Status FusedIrEmitter::FinishVisit(HloInstruction* root) {
   fused_root_ = root;
-  return tensorflow::Status::OK();
+  return Status::OK();
 }
 
 FusedIrEmitter::Generator FusedIrEmitter::GetRootGenerator() const {
