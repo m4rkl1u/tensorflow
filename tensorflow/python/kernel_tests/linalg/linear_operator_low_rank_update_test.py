@@ -20,7 +20,6 @@ from __future__ import print_function
 import numpy as np
 
 from tensorflow.python.framework import dtypes
-from tensorflow.python.framework import random_seed
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops.linalg import linalg as linalg_lib
@@ -28,7 +27,6 @@ from tensorflow.python.ops.linalg import linear_operator_test_util
 from tensorflow.python.platform import test
 
 linalg = linalg_lib
-random_seed.set_random_seed(23)
 rng = np.random.RandomState(0)
 
 
@@ -49,12 +47,6 @@ class BaseLinearOperatorLowRankUpdatetest(object):
   _use_v = None
 
   @property
-  def _dtypes_to_test(self):
-    # TODO(langmore) Test complex types once cholesky works with them.
-    # See comment in LinearOperatorLowRankUpdate.__init__.
-    return [dtypes.float32, dtypes.float64]
-
-  @property
   def _operator_build_infos(self):
     build_info = linear_operator_test_util.OperatorBuildInfo
     # Previously we had a (2, 10, 10) shape at the end.  We did this to test the
@@ -68,7 +60,17 @@ class BaseLinearOperatorLowRankUpdatetest(object):
         build_info((3, 4, 4)),
         build_info((2, 1, 4, 4))]
 
-  def _operator_and_matrix(self, build_info, dtype, use_placeholder):
+  def _gen_positive_diag(self, dtype, diag_shape):
+    if dtype.is_complex:
+      diag = linear_operator_test_util.random_uniform(
+          diag_shape, minval=1e-4, maxval=1., dtype=dtypes.float32)
+      return math_ops.cast(diag, dtype=dtype)
+
+    return linear_operator_test_util.random_uniform(
+        diag_shape, minval=1e-4, maxval=1., dtype=dtype)
+
+  def _operator_and_matrix(self, build_info, dtype, use_placeholder,
+                           ensure_self_adjoint_and_pd=False):
     # Recall A = L + UDV^H
     shape = list(build_info.shape)
     diag_shape = shape[:-1]
@@ -78,8 +80,7 @@ class BaseLinearOperatorLowRankUpdatetest(object):
 
     # base_operator L will be a symmetric positive definite diagonal linear
     # operator, with condition number as high as 1e4.
-    base_diag = linear_operator_test_util.random_uniform(
-        diag_shape, minval=1e-4, maxval=1., dtype=dtype)
+    base_diag = self._gen_positive_diag(dtype, diag_shape)
     lin_op_base_diag = base_diag
 
     # U
@@ -93,9 +94,8 @@ class BaseLinearOperatorLowRankUpdatetest(object):
     lin_op_v = v
 
     # D
-    if self._is_diag_update_positive:
-      diag_update = linear_operator_test_util.random_uniform(
-          diag_update_shape, minval=1e-4, maxval=1., dtype=dtype)
+    if self._is_diag_update_positive or ensure_self_adjoint_and_pd:
+      diag_update = self._gen_positive_diag(dtype, diag_update_shape)
     else:
       diag_update = linear_operator_test_util.random_normal(
           diag_update_shape, stddev=1e-4, dtype=dtype)
@@ -110,7 +110,9 @@ class BaseLinearOperatorLowRankUpdatetest(object):
           diag_update, shape=None)
 
     base_operator = linalg.LinearOperatorDiag(
-        lin_op_base_diag, is_positive_definite=True)
+        lin_op_base_diag,
+        is_positive_definite=True,
+        is_self_adjoint=True)
 
     operator = linalg.LinearOperatorLowRankUpdate(
         base_operator,
@@ -169,12 +171,17 @@ class LinearOperatorLowRankUpdatetestWithDiagUseCholesky(
     self._rtol[dtypes.float32] = 1e-5
     self._atol[dtypes.float64] = 1e-10
     self._rtol[dtypes.float64] = 1e-10
+    self._rtol[dtypes.complex64] = 1e-4
 
 
 class LinearOperatorLowRankUpdatetestWithDiagCannotUseCholesky(
     BaseLinearOperatorLowRankUpdatetest,
     linear_operator_test_util.SquareLinearOperatorDerivedClassTest):
   """A = L + UDU^H, D !> 0, L > 0 ==> A !> 0 and we cannot use a Cholesky."""
+
+  @property
+  def _tests_to_skip(self):
+    return ["cholesky"]
 
   _use_diag_update = True
   _is_diag_update_positive = False
@@ -188,6 +195,7 @@ class LinearOperatorLowRankUpdatetestWithDiagCannotUseCholesky(
     self._rtol[dtypes.float32] = 1e-4
     self._atol[dtypes.float64] = 1e-9
     self._rtol[dtypes.float64] = 1e-9
+    self._rtol[dtypes.complex64] = 1e-4
 
 
 class LinearOperatorLowRankUpdatetestNoDiagUseCholesky(
@@ -206,12 +214,17 @@ class LinearOperatorLowRankUpdatetestNoDiagUseCholesky(
     self._rtol[dtypes.float32] = 1e-5
     self._atol[dtypes.float64] = 1e-10
     self._rtol[dtypes.float64] = 1e-10
+    self._rtol[dtypes.complex64] = 1e-4
 
 
 class LinearOperatorLowRankUpdatetestNoDiagCannotUseCholesky(
     BaseLinearOperatorLowRankUpdatetest,
     linear_operator_test_util.SquareLinearOperatorDerivedClassTest):
   """A = L + UV^H, L > 0 ==> A is not symmetric and we cannot use a Cholesky."""
+
+  @property
+  def _tests_to_skip(self):
+    return ["cholesky"]
 
   _use_diag_update = False
   _is_diag_update_positive = None
@@ -225,6 +238,7 @@ class LinearOperatorLowRankUpdatetestNoDiagCannotUseCholesky(
     self._rtol[dtypes.float32] = 1e-4
     self._atol[dtypes.float64] = 1e-9
     self._rtol[dtypes.float64] = 1e-9
+    self._rtol[dtypes.complex64] = 1e-4
 
 
 class LinearOperatorLowRankUpdatetestWithDiagNotSquare(
@@ -249,7 +263,7 @@ class LinearOpearatorLowRankUpdateBroadcastsShape(test.TestCase):
 
     # domain_dimension is 3
     self.assertAllEqual([2, 3, 3], operator.shape)
-    with self.test_session():
+    with self.cached_session():
       self.assertAllEqual([2, 3, 3], operator.to_dense().eval().shape)
 
   def test_dynamic_shape_broadcasts_up_from_operator_to_other_args(self):
@@ -267,7 +281,7 @@ class LinearOpearatorLowRankUpdateBroadcastsShape(test.TestCase):
         u_shape_ph: [2, 3, 2],  # batch_shape = [2]
     }
 
-    with self.test_session():
+    with self.cached_session():
       shape_tensor = operator.shape_tensor().eval(feed_dict=feed_dict)
       self.assertAllEqual([2, 3, 3], shape_tensor)
       dense = operator.to_dense().eval(feed_dict=feed_dict)

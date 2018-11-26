@@ -18,6 +18,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import functools
 import os
 
 from google.protobuf.any_pb2 import Any
@@ -32,13 +33,14 @@ from tensorflow.python.lib.io import file_io
 from tensorflow.python.ops import variables
 from tensorflow.python.platform import tf_logging
 from tensorflow.python.saved_model import constants
+from tensorflow.python.saved_model import utils_impl as saved_model_utils
 from tensorflow.python.training import saver as tf_saver
 from tensorflow.python.util import compat
+from tensorflow.python.util.deprecation import deprecated_args
 from tensorflow.python.util.tf_export import tf_export
 
 
-@tf_export("saved_model.builder.SavedModelBuilder")
-class SavedModelBuilder(object):
+class _SavedModelBuilder(object):
   """Builds the `SavedModel` protocol buffer and saves variables and assets.
 
   The `SavedModelBuilder` class provides functionality to build a `SavedModel`
@@ -59,14 +61,14 @@ class SavedModelBuilder(object):
   Typical usage for the `SavedModelBuilder`:
   ```python
   ...
-  builder = tf.saved_model.builder.SavedModelBuilder(export_dir)
+  builder = tf.saved_model.Builder(export_dir)
 
   with tf.Session(graph=tf.Graph()) as sess:
     ...
     builder.add_meta_graph_and_variables(sess,
                                     ["foo-tag"],
                                     signature_def_map=foo_signatures,
-                                    assets_collection=foo_assets)
+                                    assets_list=foo_assets)
   ...
 
   with tf.Session(graph=tf.Graph()) as sess:
@@ -76,6 +78,11 @@ class SavedModelBuilder(object):
 
   builder.save()
   ```
+
+  Note: This function will only be available through the v1 compatibility
+  library as tf.compat.v1.saved_model.builder.SavedModelBuilder or
+  tf.compat.v1.saved_model.Builder. Tensorflow 2.0 will introduce a new
+  object-based method of creating SavedModels.
   """
 
   def __init__(self, export_dir):
@@ -98,25 +105,10 @@ class SavedModelBuilder(object):
     # weights.
     self._has_saved_variables = False
 
-  def _save_and_write_assets(self, assets_collection_to_add=None):
-    """Saves asset to the meta graph and writes asset files to disk.
-
-    Args:
-      assets_collection_to_add: The collection where the asset paths are setup.
-    """
-    asset_filename_map = _maybe_save_assets(assets_collection_to_add)
-
-    # Return if there are no assets to write.
-    if not asset_filename_map:
-      tf_logging.info("No assets to write.")
-      return
-
-    assets_destination_dir = os.path.join(
-        compat.as_bytes(self._export_dir),
-        compat.as_bytes(constants.ASSETS_DIRECTORY))
-
-    if not file_io.file_exists(assets_destination_dir):
-      file_io.recursive_create_dir(assets_destination_dir)
+  def _copy_assets_to_destination_dir(self, asset_filename_map):
+    """Copy all assets from source path to destination path."""
+    assets_destination_dir = saved_model_utils.get_or_create_assets_dir(
+        self._export_dir)
 
     # Copy each asset from source path to destination path.
     for asset_basename, asset_source_filepath in asset_filename_map.items():
@@ -133,39 +125,51 @@ class SavedModelBuilder(object):
     tf_logging.info("Assets written to: %s",
                     compat.as_text(assets_destination_dir))
 
-  def _maybe_add_legacy_init_op(self, legacy_init_op=None):
-    """Add legacy init op to the SavedModel.
+  def _save_and_write_assets(self, meta_graph_def, assets_list=None):
+    """Saves asset to the meta graph and writes asset files to disk.
 
     Args:
-      legacy_init_op: Optional legacy init op to support backward compatibility.
-
-    Raises:
-      TypeError if legacy init op is not of type `Operation`.
-      AssertionError if the graph already contains one or more legacy init ops.
+      meta_graph_def: The meta graph def to which the assets will be added.
+      assets_list: The list where the asset paths are setup.
     """
-    if legacy_init_op is not None:
-      if not isinstance(legacy_init_op, ops.Operation):
-        raise TypeError("legacy_init_op needs to be an Operation: %r" %
-                        legacy_init_op)
-      if ops.get_collection(constants.LEGACY_INIT_OP_KEY):
-        raise AssertionError(
-            "graph already contains one or more legacy init ops under the "
-            "collection {}.".format(constants.LEGACY_INIT_OP_KEY))
-      ops.add_to_collection(constants.LEGACY_INIT_OP_KEY, legacy_init_op)
+    # Creates a function that adds assets into the meta graph def.
+    write_fn = functools.partial(_add_asset_to_metagraph, meta_graph_def)
+    asset_filename_map = _maybe_save_assets(write_fn, assets_list)
 
-  def _add_main_op(self, main_op):
-    """Add main op to the SavedModel.
+    # Return if there are no assets to write.
+    if not asset_filename_map:
+      tf_logging.info("No assets to write.")
+      return
+
+    # Copy assets from source path to destination path.
+    self._copy_assets_to_destination_dir(asset_filename_map)
+
+  def _maybe_add_main_op(self, main_op):
+    """Adds main op to the SavedModel.
 
     Args:
-      main_op: Main op to run as part of graph initialization.
+      main_op: Main op to run as part of graph initialization. If None, no
+        main op will be added to the graph.
 
     Raises:
-      TypeError if main op is not of type `Operation`.
+      TypeError: if main op is provided but is not of type `Operation`.
+      ValueError: if the Graph already contains an init op.
     """
-    if main_op is not None:
-      if not isinstance(main_op, ops.Operation):
-        raise TypeError("main_op needs to be an Operation: %r" % main_op)
-      ops.add_to_collection(constants.MAIN_OP_KEY, main_op)
+    if main_op is None:
+      return
+
+    if not isinstance(main_op, ops.Operation):
+      raise TypeError("main_op needs to be an Operation: %r" % main_op)
+
+    # Validate that no other init ops have been added to this graph already.
+    # We check main_op and legacy_init_op for thoroughness and explicitness.
+    for init_op_key in (constants.MAIN_OP_KEY, constants.LEGACY_INIT_OP_KEY):
+      if ops.get_collection(init_op_key):
+        raise ValueError(
+            "Graph already contains one or more main ops under the "
+            "collection {}.".format(init_op_key))
+
+    ops.add_to_collection(constants.MAIN_OP_KEY, main_op)
 
   def _add_train_op(self, train_op):
     """Add train op to the SavedModel.
@@ -256,17 +260,9 @@ class SavedModelBuilder(object):
         for outputs_key in outputs:
           self._validate_tensor_info(outputs[outputs_key])
 
-  def _add_collections(
-      self, assets_collection, legacy_init_op, main_op, train_op):
+  def _add_collections(self, main_op, train_op):
     """Add asset and op collections to be saved."""
-    # Save asset files and write them to disk, if any.
-    self._save_and_write_assets(assets_collection)
-
-    if main_op is None:
-      # Add legacy init op to the SavedModel.
-      self._maybe_add_legacy_init_op(legacy_init_op)
-    else:
-      self._add_main_op(main_op)
+    self._maybe_add_main_op(main_op)
 
     self._add_train_op(train_op)
 
@@ -282,10 +278,13 @@ class SavedModelBuilder(object):
           allow_empty=True)
     return saver
 
+  @deprecated_args(None,
+                   "Pass your op to the equivalent parameter main_op instead.",
+                   "legacy_init_op")
   def add_meta_graph(self,
                      tags,
                      signature_def_map=None,
-                     assets_collection=None,
+                     assets_list=None,
                      legacy_init_op=None,
                      clear_devices=False,
                      main_op=None,
@@ -302,11 +301,11 @@ class SavedModelBuilder(object):
       tags: The set of tags to annotate the meta graph def with.
       signature_def_map: The map of signature defs to be added to the meta graph
           def.
-      assets_collection: Assets collection to be saved with SavedModel. Note
-          that this collection should be a subset of the assets saved as part of
+      assets_list: Assets to be saved with SavedModel. Note
+          that this list should be a subset of the assets saved as part of
           the first meta graph in the SavedModel.
       legacy_init_op: Legacy support for op or group of ops to execute after the
-          restore op upon a load.
+          restore op upon a load. Deprecated; please use main_op instead.
       clear_devices: Set to true if the device info on the default graph should
           be cleared.
       main_op: Op or group of ops to execute when the graph is loaded. Note
@@ -333,8 +332,12 @@ class SavedModelBuilder(object):
     # properly populated.
     self._validate_signature_def_map(signature_def_map)
 
-    # Add assets and ops
-    self._add_collections(assets_collection, legacy_init_op, main_op, None)
+    # legacy_init_op is deprecated, and going away in TF 2.0.
+    # Re-mapping to main_op, as treatment is identical regardless.
+    main_op = main_op or legacy_init_op
+
+    # Add ops to collection.
+    self._add_collections(main_op=main_op, train_op=None)
 
     saver = self._maybe_create_saver(saver)
 
@@ -348,14 +351,20 @@ class SavedModelBuilder(object):
     meta_graph_def = saver.export_meta_graph(
         clear_devices=clear_devices, strip_default_attrs=strip_default_attrs)
 
+    # Save asset files and write them to disk, if any.
+    self._save_and_write_assets(meta_graph_def, assets_list)
+
     # Tag the meta graph def and add it to the SavedModel.
     self._tag_and_add_meta_graph(meta_graph_def, tags, signature_def_map)
 
+  @deprecated_args(None,
+                   "Pass your op to the equivalent parameter main_op instead.",
+                   "legacy_init_op")
   def add_meta_graph_and_variables(self,
                                    sess,
                                    tags,
                                    signature_def_map=None,
-                                   assets_collection=None,
+                                   assets_list=None,
                                    legacy_init_op=None,
                                    clear_devices=False,
                                    main_op=None,
@@ -376,9 +385,9 @@ class SavedModelBuilder(object):
       tags: The set of tags with which to save the meta graph.
       signature_def_map: The map of signature def map to add to the meta graph
         def.
-      assets_collection: Assets collection to be saved with SavedModel.
+      assets_list: Assets to be saved with SavedModel.
       legacy_init_op: Legacy support for op or group of ops to execute after the
-          restore op upon a load.
+          restore op upon a load. Deprecated; please use main_op instead.
       clear_devices: Set to true if the device info on the default graph should
           be cleared.
       main_op: Op or group of ops to execute when the graph is loaded. Note
@@ -402,19 +411,15 @@ class SavedModelBuilder(object):
     # properly populated.
     self._validate_signature_def_map(signature_def_map)
 
-    # Add assets and ops
-    self._add_collections(assets_collection, legacy_init_op, main_op, None)
+    # legacy_init_op is deprecated, and going away in TF 2.0.
+    # Re-mapping to main_op, as treatment is identical regardless.
+    main_op = main_op or legacy_init_op
 
-    # Create the variables sub-directory, if it does not exist.
-    variables_dir = os.path.join(
-        compat.as_text(self._export_dir),
-        compat.as_text(constants.VARIABLES_DIRECTORY))
-    if not file_io.file_exists(variables_dir):
-      file_io.recursive_create_dir(variables_dir)
+    # Add ops to collection.
+    self._add_collections(main_op=main_op, train_op=None)
 
-    variables_path = os.path.join(
-        compat.as_text(variables_dir),
-        compat.as_text(constants.VARIABLES_FILENAME))
+    saved_model_utils.get_or_create_variables_dir(self._export_dir)
+    variables_path = saved_model_utils.get_variables_path(self._export_dir)
 
     saver = self._maybe_create_saver(saver)
 
@@ -435,6 +440,9 @@ class SavedModelBuilder(object):
     # TODO(soergel): Reinstate clear_extraneous_savers=True when possible.
     meta_graph_def = saver.export_meta_graph(
         clear_devices=clear_devices, strip_default_attrs=strip_default_attrs)
+
+    # Save asset files and write them to disk, if any.
+    self._save_and_write_assets(meta_graph_def, assets_list)
 
     # Tag the meta graph def and add it to the SavedModel.
     self._tag_and_add_meta_graph(meta_graph_def, tags, signature_def_map)
@@ -473,11 +481,157 @@ class SavedModelBuilder(object):
     return path
 
 
-def _maybe_save_assets(assets_collection_to_add=None):
+@tf_export(v1=["saved_model.Builder", "saved_model.builder.SavedModelBuilder"])  # pylint: disable=missing-docstring
+class SavedModelBuilder(_SavedModelBuilder):
+  __doc__ = _SavedModelBuilder.__doc__.replace("assets_list",
+                                               "assets_collection")
+
+  def __init__(self, export_dir):
+    super(SavedModelBuilder, self).__init__(export_dir=export_dir)
+
+  def _add_collections(self, assets_collection, main_op, train_op):
+    """Add asset and op collections to be saved."""
+    # Save asset files and write them to disk, if any.
+    self._save_and_write_assets(assets_collection)
+
+    self._maybe_add_main_op(main_op)
+
+    self._add_train_op(train_op)
+
+  def _save_and_write_assets(self, assets_collection_to_add=None):
+    """Saves asset to the meta graph and writes asset files to disk.
+
+    Args:
+      assets_collection_to_add: The collection where the asset paths are setup.
+    """
+    # Add assets to the collection with key `constants.ASSETS_KEY`, in the
+    # graph.
+    asset_filename_map = _maybe_save_assets(_add_asset_to_collection,
+                                            assets_collection_to_add)
+
+    # Return if there are no assets to write.
+    if not asset_filename_map:
+      tf_logging.info("No assets to write.")
+      return
+
+    # Copy assets from source path to destination path.
+    self._copy_assets_to_destination_dir(asset_filename_map)
+
+  @deprecated_args(None,
+                   "Pass your op to the equivalent parameter main_op instead.",
+                   "legacy_init_op")
+  def add_meta_graph(self,
+                     tags,
+                     signature_def_map=None,
+                     assets_collection=None,
+                     legacy_init_op=None,
+                     clear_devices=False,
+                     main_op=None,
+                     strip_default_attrs=False,
+                     saver=None):
+    if not self._has_saved_variables:
+      raise AssertionError(
+          "Graph state including variables and assets has not been saved yet. "
+          "Please invoke `add_meta_graph_and_variables()` first.")
+
+    # Validate the signature def map to ensure all included TensorInfos are
+    # properly populated.
+    self._validate_signature_def_map(signature_def_map)
+
+    # legacy_init_op is deprecated, and going away in TF 2.0.
+    # Re-mapping to main_op, as treatment is identical regardless.
+    main_op = main_op or legacy_init_op
+
+    # Add assets and ops
+    self._add_collections(assets_collection, main_op, None)
+
+    saver = self._maybe_create_saver(saver)
+
+    # The graph almost certainly previously contained at least one Saver, and
+    # possibly several (e.g. one for loading a pretrained embedding, and another
+    # for the model weights).  Removing the preexisting ones was the
+    # motivation for the clear_extraneous_savers option, but it turns out that
+    # there are edge cases where that option breaks the graph.  Until that is
+    # resolved, we just leave the option set to False for now.
+    # TODO(soergel): Reinstate clear_extraneous_savers=True when possible.
+    meta_graph_def = saver.export_meta_graph(
+        clear_devices=clear_devices, strip_default_attrs=strip_default_attrs)
+
+    # Tag the meta graph def and add it to the SavedModel.
+    self._tag_and_add_meta_graph(meta_graph_def, tags, signature_def_map)
+
+  @deprecated_args(None,
+                   "Pass your op to the equivalent parameter main_op instead.",
+                   "legacy_init_op")
+  def add_meta_graph_and_variables(self,
+                                   sess,
+                                   tags,
+                                   signature_def_map=None,
+                                   assets_collection=None,
+                                   legacy_init_op=None,
+                                   clear_devices=False,
+                                   main_op=None,
+                                   strip_default_attrs=False,
+                                   saver=None):
+    if self._has_saved_variables:
+      raise AssertionError("Graph state including variables and assets has "
+                           "already been saved. Please invoke "
+                           "`add_meta_graph()` instead.")
+
+    # Validate the signature def map to ensure all included TensorInfos are
+    # properly populated.
+    self._validate_signature_def_map(signature_def_map)
+
+    # legacy_init_op is deprecated, and going away in TF 2.0.
+    # Re-mapping to main_op, as treatment is identical regardless.
+    main_op = main_op or legacy_init_op
+
+    # Add assets and ops
+    self._add_collections(assets_collection, main_op, None)
+
+    saved_model_utils.get_or_create_variables_dir(self._export_dir)
+    variables_path = saved_model_utils.get_variables_path(self._export_dir)
+
+    saver = self._maybe_create_saver(saver)
+
+    # Save the variables. Also, disable writing the checkpoint state proto. The
+    # file is not used during SavedModel loading. In addition, since a
+    # SavedModel can be copied or moved, this avoids the checkpoint state to
+    # become outdated.
+    saver.save(sess, variables_path, write_meta_graph=False, write_state=False)
+
+    # Export the meta graph def.
+
+    # The graph almost certainly previously contained at least one Saver, and
+    # possibly several (e.g. one for loading a pretrained embedding, and another
+    # for the model weights).  Removing the preexisting ones was the
+    # motivation for the clear_extraneous_savers option, but it turns out that
+    # there are edge cases where that option breaks the graph.  Until that is
+    # resolved, we just leave the option set to False for now.
+    # TODO(soergel): Reinstate clear_extraneous_savers=True when possible.
+    meta_graph_def = saver.export_meta_graph(
+        clear_devices=clear_devices, strip_default_attrs=strip_default_attrs)
+
+    # Tag the meta graph def and add it to the SavedModel.
+    self._tag_and_add_meta_graph(meta_graph_def, tags, signature_def_map)
+
+    # Mark this instance of SavedModel as having saved variables, such that
+    # subsequent attempts to save variables will fail.
+    self._has_saved_variables = True
+
+  add_meta_graph.__doc__ = _SavedModelBuilder.add_meta_graph.__doc__.replace(
+      "assets_list", "assets_collection")
+  add_meta_graph_and_variables.__doc__ = \
+      _SavedModelBuilder.add_meta_graph_and_variables.__doc__.replace(
+          "assets_list", "assets_collection")
+
+
+def _maybe_save_assets(write_fn, assets_to_add=None):
   """Saves assets to the meta graph.
 
   Args:
-    assets_collection_to_add: The collection where the asset paths are setup.
+    write_fn: A function callback that writes asset into meta graph.
+    assets_to_add: The list where the asset paths are setup.
 
   Returns:
     A dict of asset basenames for saving to the original full path to the asset.
@@ -488,14 +642,13 @@ def _maybe_save_assets(assets_collection_to_add=None):
   # Map of target file names to original filenames
   asset_filename_map = {}
 
-  if assets_collection_to_add is None:
+  if assets_to_add is None:
     tf_logging.info("No assets to save.")
     return asset_filename_map
 
-  # Iterate over the supplied asset collection, build the `AssetFile` proto
-  # and add them to the collection with key `constants.ASSETS_KEY`, in the
-  # graph.
-  for asset_tensor in assets_collection_to_add:
+  # Iterate over the supplied assets, build the `AssetFile` proto and add them
+  # to the meta graph.
+  for asset_tensor in assets_to_add:
     asset_source_filepath = _asset_path_from_tensor(asset_tensor)
     if not asset_source_filepath:
       raise ValueError("Invalid asset filepath tensor %s" % asset_tensor)
@@ -503,10 +656,11 @@ def _maybe_save_assets(assets_collection_to_add=None):
     asset_filename = _get_asset_filename_to_add(
         asset_source_filepath, asset_filename_map)
 
-    # Build `AssetFile` proto and add it to the asset collection in the graph.
+    # Call the passed-in function that builds AssetFileDef proto and adds it
+    # to either the collection or asset_file_def field of the meta graph.
     # Note that this should be done even when the file is a duplicate of an
     # already-added file, as the tensor reference should still exist.
-    _add_asset_to_collection(asset_filename, asset_tensor)
+    write_fn(asset_filename, asset_tensor)
 
     # In the cases where we are adding a duplicate, this will result in the
     # last of the filepaths being the one used for copying the file to the
@@ -544,7 +698,7 @@ def _get_asset_filename_to_add(asset_filepath, asset_filename_map):
 
   other_asset_filepath = asset_filename_map[asset_filename]
   if other_asset_filepath == asset_filepath:
-    # This is the same file, stored twice in the collection list. No need
+    # This is the same file, stored twice in the list. No need
     # to make unique.
     return asset_filename
 
@@ -589,6 +743,20 @@ def _asset_path_from_tensor(path_tensor):
   if len(str_values) != 1:
     raise TypeError("Asset path tensor must be a scalar.")
   return str_values[0]
+
+
+def _add_asset_to_metagraph(meta_graph_def, asset_filename, asset_tensor):
+  """Builds an asset proto and adds it to the meta graph def.
+
+  Args:
+    meta_graph_def: The meta graph def to which the asset will be added.
+    asset_filename: The filename of the asset to be added.
+    asset_tensor: The asset tensor used to populate the tensor info of the asset
+      proto.
+  """
+  asset_proto = meta_graph_def.asset_file_def.add()
+  asset_proto.filename = asset_filename
+  asset_proto.tensor_info.name = asset_tensor.name
 
 
 def _add_asset_to_collection(asset_filename, asset_tensor):
